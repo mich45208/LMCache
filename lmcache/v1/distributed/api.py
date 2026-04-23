@@ -29,10 +29,52 @@ class ObjectKey:
     """ Content hash of this particular chunk """
 
     model_name: str
-    """ Name of the model this chunk belongs to """
+    """ Name of the model this chunk belongs to.
+
+    Invariant: must not contain ``@``. The L2 adapters use ``@`` as the
+    field separator in serialized keys/filenames and rely on this
+    invariant for unambiguous parsing. HuggingFace model IDs use
+    alphanumerics + ``/-_.`` so this rejects nothing that appears in
+    practice.
+    """
 
     kv_rank: int
     """ The rank that uniquely identifies the slice of the KV cache """
+
+    cache_salt: str = ""
+    """ Per-user isolation salt. Same content from different users with
+    different cache_salt values produces different ObjectKeys, giving
+    strict per-user cache isolation. Defaults to empty string, in which
+    case serialized keys and filenames match the pre-cache_salt shape
+    (no trailing salt field) — no migration is needed for un-salted
+    deployments.
+
+    Invariant: must not contain ``@``, ``/``, ``\\``, or NUL. The L2
+    adapters use ``@`` as the field separator; ``/`` and ``\\`` are
+    filesystem path separators (FS adapter embeds the salt into
+    filenames); NUL terminates C strings (C++ connector). Max length
+    128 to stay well within ``NAME_MAX`` (255) after the model, rank,
+    hash, and extension are added.
+    """
+
+    _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
+    _SALT_MAX_LEN = 128
+
+    def __post_init__(self) -> None:
+        if "@" in self.model_name:
+            raise ValueError(
+                f"model_name must not contain '@' (got {self.model_name!r})"
+            )
+        bad = self._SALT_FORBIDDEN_CHARS & set(self.cache_salt)
+        if bad:
+            raise ValueError(
+                f"cache_salt must not contain {bad!r} (got {self.cache_salt!r})"
+            )
+        if len(self.cache_salt) > self._SALT_MAX_LEN:
+            raise ValueError(
+                f"cache_salt exceeds max length {self._SALT_MAX_LEN} "
+                f"(got {len(self.cache_salt)})"
+            )
 
     @staticmethod
     def IntHash2Bytes(chunk_hash: int) -> bytes:
@@ -114,38 +156,58 @@ class MemoryLayoutDesc:
             )
 
 
-def ipc_keys_to_object_keys(ipc_keys: list[IPCCacheEngineKey]) -> list[ObjectKey]:
-    """
-    Convert a list of IPCCacheEngineKey to a list of ObjectKey
+@dataclass(frozen=True)
+class PrefetchHandle:
+    """Opaque handle returned by ``StorageManager.submit_prefetch_task``.
 
-    When the ipc key's worker id is unspecified (None), this function will generate
-    (explode) multiple ObjectKeys for all workers in the world_size.
+    Carries the bookkeeping needed to later query lookup / prefetch status
+    without exposing controller internals.
+    """
+
+    prefetch_request_id: int
+    """Opaque ID for tracking L2 prefetch in the controller.
+    -1 if no L2 request was submitted."""
+
+    external_request_id: str
+    """Request ID from the caller for end-to-end tracing."""
+
+    l1_prefix_hit_count: int
+    """Number of leading keys already in L1 at submission time."""
+
+    total_requested_keys: int
+    """Total number of keys originally requested."""
+
+    submit_time: float
+    """Monotonic timestamp when the prefetch task was submitted."""
+
+
+def ipc_key_to_object_keys(
+    ipc_key: IPCCacheEngineKey,
+    chunk_hashes: list[bytes],
+) -> list[ObjectKey]:
+    """
+    Convert a single IPCCacheEngineKey and its chunk hashes to a list of ObjectKey.
+
+    When the ipc_key's worker_id is None, each chunk hash is exploded into
+    multiple ObjectKeys (one per worker in world_size).
+
+    ``cache_salt`` is read directly from ``ipc_key`` so the produced
+    ObjectKeys are per-user isolated whenever the sender set a non-empty
+    salt. There is intentionally no separate ``cache_salt`` parameter —
+    duplicating the source of truth would risk silent isolation bugs
+    where a caller passes ``ipc_key`` but forgets the salt.
 
     Args:
-        ipc_keys (list[IPCCacheEngineKey]): The list of IPC keys to convert
+        ipc_key: The IPC key providing model_name, world_size, worker_id,
+            and cache_salt.
+        chunk_hashes: List of chunk hash bytes, one per chunk.
 
     Returns:
-        list[ObjectKey]: The converted list of ObjectKey
-
-    Note:
-        For now, we expect all the ipc keys have the same world size. Although
-        it won't break even if they are different, it's not the intended use case.
+        list[ObjectKey]: The converted list of ObjectKey.
     """
-    if not ipc_keys:
-        return []
-
-    all_world_size_same = all(
-        ipc_key.world_size == ipc_keys[0].world_size for ipc_key in ipc_keys
-    )
-    if not all_world_size_same:
-        logger.warning(
-            "ipc_keys_to_object_keys: ipc keys have different world sizes. "
-            "This is not expected."
-        )
-
+    cache_salt = ipc_key.cache_salt
     storage_keys = []
-    for ipc_key in ipc_keys:
-        assert ipc_key.chunk_hash is not None
+    for chunk_hash in chunk_hashes:
         if ipc_key.worker_id is None:
             # For look up request, we want to expand to all workers
             for worker_id in range(ipc_key.world_size):
@@ -160,9 +222,10 @@ def ipc_keys_to_object_keys(ipc_keys: list[IPCCacheEngineKey]) -> list[ObjectKey
 
                 storage_keys.append(
                     ObjectKey(
-                        chunk_hash=ipc_key.chunk_hash,
+                        chunk_hash=chunk_hash,
                         model_name=ipc_key.model_name,
                         kv_rank=kv_rank,
+                        cache_salt=cache_salt,
                     )
                 )
         else:
@@ -175,9 +238,10 @@ def ipc_keys_to_object_keys(ipc_keys: list[IPCCacheEngineKey]) -> list[ObjectKey
 
             storage_keys.append(
                 ObjectKey(
-                    chunk_hash=ipc_key.chunk_hash,
+                    chunk_hash=chunk_hash,
                     model_name=ipc_key.model_name,
                     kv_rank=kv_rank,
+                    cache_salt=cache_salt,
                 )
             )
 

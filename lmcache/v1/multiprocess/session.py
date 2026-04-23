@@ -6,12 +6,13 @@ in the multiprocess cache server.
 
 # Standard
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional, overload
 import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.multiprocess.custom_types import IPCCacheEngineKey
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
@@ -19,7 +20,11 @@ logger = init_logger(__name__)
 
 @dataclass
 class Session:
-    """Tracks accumulated token IDs and computed chunk hashes for a request."""
+    """Tracks accumulated token IDs and computed chunk hashes for a request.
+
+    Thread-safe: all public methods are protected by an internal lock
+    to allow concurrent access from multiple TP worker threads.
+    """
 
     request_id: str
     hasher: TokenHasher
@@ -28,6 +33,8 @@ class Session:
     last_prefix_hash: Any = None
     num_chunks_processed: int = 0
     created_at: float = field(default_factory=time.time)
+    lookup_ipc_key: Optional[IPCCacheEngineKey] = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_tokens(self, full_token_ids: list[int]) -> None:
         """Update the token sequence (idempotent, replaces not extends).
@@ -35,17 +42,31 @@ class Session:
         Args:
             full_token_ids: Complete token sequence.
         """
-        self.token_ids = full_token_ids
+        with self._lock:
+            self.token_ids = full_token_ids
 
-    def get_hashes(self, start: int, end: int) -> list:
+    @overload
+    def get_hashes(self, start: int, end: int) -> list: ...
+
+    @overload
+    def get_hashes(self, start: int) -> list: ...
+
+    def get_hashes(self, start: int, end: int | None = None) -> list:
         """Compute and return chunk hashes for the [start, end) token range.
 
         Internally computes rolling hashes up to end_chunk, skipping
         already-computed chunks.
 
+        Two calling conventions are supported (declared via ``@overload``)::
+
+            get_hashes(start, end)  # explicit end
+            get_hashes(start)       # end = last full-chunk boundary
+
         Args:
-            start: Start token index.
-            end: End token index.
+            start: Start token index (must be aligned to chunk_size).
+            end: End token index (must be aligned to chunk_size).
+                When omitted (``None``), automatically set to the last
+                full-chunk boundary of the current token sequence.
 
         Returns:
             List of hash values for chunks in [start_chunk, end_chunk).
@@ -54,15 +75,20 @@ class Session:
         assert start % chunk_size == 0, (
             f"start ({start}) must be a multiple of chunk_size ({chunk_size})"
         )
-        assert end % chunk_size == 0, (
-            f"end ({end}) must be a multiple of chunk_size ({chunk_size})"
-        )
         start_chunk = start // chunk_size
-        end_chunk = end // chunk_size
 
-        self._compute_hash(end_chunk)
-
-        return self.chunk_hashes[start_chunk:end_chunk]
+        with self._lock:
+            if end is None:
+                # No explicit end: use the last full-chunk boundary.
+                # Lock must be held here because `self.token_ids` may be
+                # concurrently replaced by `set_tokens` from another thread.
+                end = len(self.token_ids) - (len(self.token_ids) % chunk_size)
+            assert end % chunk_size == 0, (
+                f"end ({end}) must be a multiple of chunk_size ({chunk_size})"
+            )
+            end_chunk = end // chunk_size
+            self._compute_hash(end_chunk)
+            return self.chunk_hashes[start_chunk:end_chunk]
 
     def _compute_hash(self, end_chunk: int) -> None:
         """Compute rolling hashes up to end_chunk.
@@ -118,16 +144,22 @@ class SessionManager:
                 logger.debug("Created session for request_id=%s", request_id)
             return self._sessions[request_id]
 
-    def remove(self, request_id: str) -> None:
+    def remove(self, request_id: str) -> Optional[Session]:
         """Remove a session by request_id.
 
         Args:
             request_id: Unique request identifier.
+
+        Returns:
+            The removed session, or None if no session was found.
         """
         with self._lock:
             if request_id in self._sessions:
+                session = self._sessions[request_id]
                 del self._sessions[request_id]
                 logger.debug("Removed session for request_id=%s", request_id)
+                return session
+            return None
 
     def cleanup_expired(self) -> int:
         """Remove sessions that have exceeded their TTL.
@@ -147,3 +179,12 @@ class SessionManager:
         if expired:
             logger.info("Cleaned up %d expired sessions", len(expired))
         return len(expired)
+
+    def active_count(self) -> int:
+        """Return the number of active sessions.
+
+        Returns:
+            Number of currently tracked sessions.
+        """
+        with self._lock:
+            return len(self._sessions)

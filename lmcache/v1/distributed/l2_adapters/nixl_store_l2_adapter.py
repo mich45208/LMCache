@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Future
+from __future__ import annotations
+
 # Standard
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,7 +26,13 @@ from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
-from lmcache.v1.distributed.l2_adapters.config import NixlStoreL2AdapterConfig
+from lmcache.v1.distributed.l2_adapters.config import (
+    L2AdapterConfigBase,
+    register_l2_adapter_type,
+)
+from lmcache.v1.distributed.l2_adapters.factory import (
+    register_l2_adapter_factory,
+)
 from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
@@ -73,6 +82,7 @@ class NixlObjPool:
             num_total_objs: Total number of storage slots to manage.
         """
         self.indices = list(range(num_total_objs))
+        self._total = num_total_objs
         self._lock = threading.Lock()
 
     def batched_allocate(self, num_objs: int) -> list[int]:
@@ -105,6 +115,18 @@ class NixlObjPool:
         """
         with self._lock:
             self.indices.extend(obj_indices)
+
+    def get_usage(self) -> tuple[float, float]:
+        """
+        Return (current_usage, usage_after_ongoing_eviction) in [0, 1].
+
+        Both values are identical because slot frees are synchronous.
+        """
+        with self._lock:
+            if self._total == 0:
+                return (0.0, 0.0)
+            usage = (self._total - len(self.indices)) / self._total
+            return (usage, usage)
 
 
 class NixlStorageAgent:
@@ -154,17 +176,23 @@ class NixlStorageAgent:
             device_id=0,  # 0 indicates cpu
         )
 
-        self.pool = NixlObjPool(num_total_objs=self.pool_size)
         if self.backend in ["GDS", "GDS_MT", "POSIX", "HF3FS"]:
+            file_size = int(
+                self.backend_params.get("file_size", l1_memory_desc.align_bytes)
+            )
+            pages_per_file = file_size // l1_memory_desc.align_bytes
+            self.pool = NixlObjPool(num_total_objs=self.pool_size * pages_per_file)
             self.init_storage_handlers_file(
-                num_pages=self.pool_size,
+                num_files=self.pool_size,
                 page_size=l1_memory_desc.align_bytes,
+                file_size=file_size,
                 file_path=self.backend_params["file_path"],
                 # TODO(Jiayi): Need to make argument parsing more elegant
                 use_direct_io=str(self.backend_params["use_direct_io"]).lower()
                 == "true",
             )
         elif self.backend in ["OBJ"]:
+            self.pool = NixlObjPool(num_total_objs=self.pool_size)
             self.init_storage_handlers_object(
                 page_size=l1_memory_desc.align_bytes,
                 num_pages=self.pool_size,
@@ -198,12 +226,32 @@ class NixlStorageAgent:
 
     def init_storage_handlers_file(
         self,
-        num_pages: int,
+        num_files: int,
         page_size: int,
+        file_size: int,
         file_path: str,
         use_direct_io: bool,
     ):
-        """Initialize storage handlers for file-based backends."""
+        """Initialize storage handlers for file-based backends.
+
+        Each file holds ``file_size // page_size`` pages at successive offsets.
+        ``file_size`` must be a multiple of ``page_size``.
+
+        Args:
+            num_files: Number of storage files to create.
+            page_size: Granularity of L1 memory pages (transfer unit size).
+            file_size: Size in bytes of each storage file. Must be a multiple
+                of ``page_size``.
+            file_path: Directory where storage files are created.
+            use_direct_io: Whether to open files with O_DIRECT.
+        """
+        if file_size % page_size != 0:
+            raise ValueError(
+                f"file_size ({file_size}) must be a multiple of page_size ({page_size})"
+            )
+
+        pages_per_file = file_size // page_size
+        num_pages = num_files * pages_per_file
 
         # Create file descriptors for Nixl to register
         fds: list[int] = []
@@ -216,24 +264,30 @@ class NixlStorageAgent:
                     "use_direct_io is True, but O_DIRECT is not available on "
                     "this system. Falling back to buffered I/O."
                 )
-        for i in range(num_pages):
+        for i in range(num_files):
             filename = f"obj_{i}_{uuid.uuid4().hex[0:4]}.bin"
             tmp_path = os.path.join(file_path, filename)
             fd = os.open(tmp_path, flags)
             fds.append(fd)
 
-        # Register and prepare xfer handler
+        # Register each file covering the full file_size.
+        # Build one xfer_desc entry per page slot (page index i maps to
+        # offset (i % pages_per_file) * page_size inside fd[i // pages_per_file]).
         reg_list = []
         xfer_desc = []
         for fd in fds:
-            reg_list.append((0, page_size, fd, ""))
-            xfer_desc.append((0, page_size, fd))
+            reg_list.append((0, file_size, fd, ""))
+        for page_idx in range(num_pages):
+            fd = fds[page_idx // pages_per_file]
+            offset = (page_idx % pages_per_file) * page_size
+            xfer_desc.append((offset, page_size, fd))
         reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="FILE")
         xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="FILE")
         xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, xfer_desc, mem_type="FILE"
+            self.agent_name, xfer_descs, mem_type="FILE"
         )
 
+        self.storage_fds = fds
         self.storage_reg_descs = reg_descs
         self.storage_xfer_descs = xfer_descs
         self.storage_xfer_handler = xfer_handler
@@ -261,7 +315,7 @@ class NixlStorageAgent:
         reg_descs = self.nixl_agent.register_memory(reg_list, mem_type="OBJ")
         xfer_descs = self.nixl_agent.get_xfer_descs(xfer_desc, mem_type="OBJ")
         xfer_handler = self.nixl_agent.prep_xfer_dlist(
-            self.agent_name, xfer_desc, mem_type="OBJ"
+            self.agent_name, xfer_descs, mem_type="OBJ"
         )
 
         self.storage_reg_descs = reg_descs
@@ -349,6 +403,8 @@ class NixlStorageAgent:
         self.nixl_agent.release_dlist_handle(self.mem_xfer_handler)
         self.nixl_agent.deregister_memory(self.storage_reg_descs)
         self.nixl_agent.deregister_memory(self.mem_reg_descs)
+        for fd in getattr(self, "storage_fds", []):
+            os.close(fd)
 
 
 class NixlStoreL2Adapter(L2AdapterInterface):
@@ -366,6 +422,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             l1_memory_desc: Descriptor of the L1 memory buffer to register with the
                 Nixl backend for DMA transfers.
         """
+        super().__init__()
         self._config = config
 
         self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
@@ -527,10 +584,75 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             self._loop.call_soon_threadsafe(self._loop.stop)
 
         self._loop_thread.join()
+        self._loop.close()
 
         os.close(self._store_efd)
         os.close(self._lookup_efd)
         os.close(self._load_efd)
+
+    #####################
+    # Eviction Interface
+    #####################
+
+    def delete(self, keys: list[ObjectKey]) -> None:
+        """
+        Delete a batch of objects from Nixl storage, freeing their page slots.
+
+        Pinned objects (pin_count > 0) are skipped to avoid racing with an
+        in-flight load; the eviction controller will retry them on the next
+        cycle once they are unpinned.
+        """
+        # TODO(Jiayi): Optimize lock usage here
+        deleted_keys: list[ObjectKey] = []
+        with self._lock:
+            for key in keys:
+                obj = self._memory_objects.get(key)
+                if obj is None:
+                    continue
+                if obj.pin_count > 0:
+                    logger.debug(
+                        "Skipping eviction of pinned key %s (pin_count=%d)",
+                        key,
+                        obj.pin_count,
+                    )
+                    continue
+                del self._memory_objects[key]
+                self.nixl_agent.pool.batched_free(obj.page_indices)
+                deleted_keys.append(key)
+        if deleted_keys:
+            self._notify_keys_deleted(deleted_keys)
+
+    def get_usage(self) -> tuple[float, float]:
+        """
+        Return (current_usage, usage_after_ongoing_eviction) based on pool slots.
+        """
+        return self.nixl_agent.pool.get_usage()
+
+    #####################
+    # Status Interface
+    #####################
+
+    def report_status(self) -> dict:
+        """Return a status dict for the Nixl L2 adapter."""
+        # NOTE(Jiayi): This function looks pretty slow.
+        with self._lock:
+            stored_object_count = len(self._memory_objects)
+            pinned_object_count = sum(
+                1 for obj in self._memory_objects.values() if obj.pin_count > 0
+            )
+        pool = self.nixl_agent.pool
+        with pool._lock:
+            pool_free_slots = len(pool.indices)
+        return {
+            "is_healthy": self._loop_thread.is_alive(),
+            "type": "NixlStoreL2Adapter",
+            "backend": self._config.backend,
+            "stored_object_count": stored_object_count,
+            "pinned_object_count": pinned_object_count,
+            "pool_size": self._config.pool_size,
+            "pool_free_slots": pool_free_slots,
+            "event_loop_alive": self._loop_thread.is_alive(),
+        }
 
     ##################
     # Helper functions
@@ -589,8 +711,14 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             # Get memory page indices and storage slot indices
             mem_indices_flat = []
             storage_indices_flat = []
+            stored_keys = []
             storage_objs = []
             for key, obj in zip(keys, objects, strict=False):
+                # Skip if key already exists to avoid leaking pool slots
+                with self._lock:
+                    if key in self._memory_objects:
+                        continue
+
                 mem_addr = obj.meta.address
                 mem_size = obj.meta.phy_size
                 mem_indices = self.nixl_agent.get_memory_indices(mem_addr, mem_size)
@@ -604,6 +732,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                 mem_indices_flat.extend(mem_indices)
                 storage_indices_flat.extend(storage_indices)
 
+                stored_keys.append(key)
                 storage_objs.append(
                     NixlStoreObj(
                         page_indices=storage_indices,
@@ -616,6 +745,13 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                     )
                 )
 
+            if not mem_indices_flat:
+                # Nothing to store (all keys already existed or pool empty)
+                with self._lock:
+                    self._completed_store_tasks[task_id] = True
+                self._signal_store_event()
+                return
+
             handle = self.nixl_agent.get_mem_to_storage_handle(
                 mem_indices_flat,
                 storage_indices_flat,
@@ -625,12 +761,14 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             self.nixl_agent.release_handle(handle)
 
             with self._lock:
-                for key, storage_obj in zip(keys, storage_objs, strict=False):
+                for key, storage_obj in zip(stored_keys, storage_objs, strict=False):
                     self._memory_objects[key] = storage_obj
                     storage_obj.decrease_pin_count()
+            self._notify_keys_stored(stored_keys)
 
         # success is only set to false for transfer failures
         except Exception:
+            logger.exception("NIXL store task %d failed", task_id)
             success = False
 
             # free storage indices if transfer fails
@@ -696,6 +834,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                 ``_completed_load_tasks``.
         """
         bitmap = Bitmap(len(keys))
+        accessed_keys: list[ObjectKey] = []
         try:
             mem_indices_flat = []
             storage_indices_flat = []
@@ -712,6 +851,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                     storage_indices_flat.extend(storage_obj.page_indices)
 
                     bitmap.set(i)
+                    accessed_keys.append(key)
 
             if mem_indices_flat:
                 handle = self.nixl_agent.get_storage_to_mem_handle(
@@ -720,9 +860,124 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                 )
                 await self.nixl_agent.post_non_blocking(handle)
                 self.nixl_agent.release_handle(handle)
-        except Exception as e:
-            logger.warning("NIXL load failed: %s", e)
+        except Exception:
+            logger.exception("NIXL load task %d failed", task_id)
 
+        if accessed_keys:
+            self._notify_keys_accessed(accessed_keys)
         with self._lock:
             self._completed_load_tasks[task_id] = bitmap
         self._signal_load_event()
+
+
+# ---------------------------------------------------------------------
+# Config and self-registration
+# ---------------------------------------------------------------------
+
+_VALID_NIXL_BACKENDS = (
+    "GDS",
+    "GDS_MT",
+    "POSIX",
+    "HF3FS",
+    "OBJ",
+)
+_FILE_BACKENDS = ("GDS", "GDS_MT", "POSIX", "HF3FS")
+
+
+class NixlStoreL2AdapterConfig(L2AdapterConfigBase):
+    """
+    Config for a Nixl-store-based L2 adapter.
+
+    Fields:
+    - backend: Nixl storage backend
+      (GDS, GDS_MT, POSIX, HF3FS, OBJ).
+    - backend_params: Backend-specific parameters as a
+      dict of string key-value pairs. For file-based
+      backends (GDS, GDS_MT, POSIX, HF3FS), must include
+      ``file_path``. May also include ``use_direct_io``
+      (default ``"false"``) and other backend-specific
+      keys.
+    - pool_size: Number of storage descriptors to
+      pre-allocate (must be > 0).
+    """
+
+    def __init__(
+        self,
+        backend: str,
+        backend_params: dict[str, str],
+        pool_size: int,
+    ):
+        if backend in _FILE_BACKENDS:
+            if "file_path" not in backend_params:
+                raise ValueError(
+                    "backend_params must include "
+                    "'file_path' for file-based "
+                    "backend %r" % backend
+                )
+            if "use_direct_io" not in backend_params:
+                raise ValueError(
+                    "backend_params must include "
+                    "'use_direct_io' for file-based "
+                    "backend %r" % backend
+                )
+        self.backend = backend
+        self.backend_params = backend_params
+        self.pool_size = pool_size
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NixlStoreL2AdapterConfig":
+        backend = d.get("backend")
+        if backend not in _VALID_NIXL_BACKENDS:
+            raise ValueError(
+                "backend must be one of %s, got %r" % (_VALID_NIXL_BACKENDS, backend)
+            )
+
+        backend_params = d.get("backend_params", {})
+        if not isinstance(backend_params, dict):
+            raise ValueError("backend_params must be a dict of string key-value pairs")
+
+        pool_size = d.get("pool_size")
+        if not isinstance(pool_size, int) or pool_size <= 0:
+            raise ValueError("pool_size must be a positive integer")
+
+        return cls(
+            backend=backend,
+            backend_params=backend_params,
+            pool_size=pool_size,
+        )
+
+    @classmethod
+    def help(cls) -> str:
+        return (
+            "Nixl store L2 adapter config fields:\n"
+            "- backend (str): Nixl storage backend, "
+            "one of %s (required)\n"
+            "- backend_params (dict): backend-specific "
+            "string key-value pairs (optional, "
+            "default empty). File-based backends "
+            "require file_path. Optional keys include "
+            "'use_direct_io' (default 'false') and "
+            "'file_size' (int, size in bytes of each "
+            "storage file slot; defaults to the L1 "
+            "page size if not set).\n"
+            "- pool_size (int): number of storage "
+            "descriptors to pre-allocate (required, "
+            ">0)" % (_VALID_NIXL_BACKENDS,)
+        )
+
+
+# Self-register config type and adapter factory
+register_l2_adapter_type("nixl_store", NixlStoreL2AdapterConfig)
+
+
+def _create_nixl_store_adapter(
+    config: L2AdapterConfigBase,
+    l1_memory_desc: Optional[L1MemoryDesc] = None,
+) -> L2AdapterInterface:
+    """Create a NixlStoreL2Adapter from config."""
+    if l1_memory_desc is None:
+        raise ValueError("l1_memory_desc is required to create a NixlStoreL2Adapter.")
+    return NixlStoreL2Adapter(config, l1_memory_desc)  # type: ignore[arg-type]
+
+
+register_l2_adapter_factory("nixl_store", _create_nixl_store_adapter)

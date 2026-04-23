@@ -21,6 +21,15 @@ BUILD_WITH_HIP = os.environ.get("BUILD_WITH_HIP", "0") == "1"
 ENABLE_CXX11_ABI = os.environ.get("ENABLE_CXX11_ABI", "1") == "1"
 
 
+def _read_requirements(path: Path) -> list[str]:
+    reqs: list[str] = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            reqs.append(line)
+    return reqs
+
+
 def hipify_wrapper() -> None:
     # Third Party
     from torch.utils.hipify.hipify_python import hipify
@@ -60,6 +69,49 @@ def hipify_wrapper() -> None:
     assert len(hipified_sources) == len(extra_files)
 
 
+def _mooncake_extension(
+    cpp_extension,
+    mooncake_sources: list[str],
+    extra_cxx_flags: list[str],
+) -> list:
+    """Build mooncake CppExtension if enabled via env vars.
+
+    Returns a list with zero or one Extension objects.
+    """
+    mc_env = os.environ.get("BUILD_MOONCAKE")
+    if mc_env is not None:
+        build_mc = mc_env == "1"
+    else:
+        build_mc = os.environ.get("MOONCAKE_INCLUDE_DIR", "") != ""
+    if not build_mc:
+        return []
+
+    mc_include = os.environ.get("MOONCAKE_INCLUDE_DIR", "")
+    mc_lib = os.environ.get("MOONCAKE_LIB_DIR", "")
+    mc_include_dirs = [
+        "csrc/storage_backends",
+        "csrc/storage_backends/mooncake",
+    ]
+    if mc_include:
+        mc_include_dirs.extend(mc_include.split(";"))
+    mc_library_dirs: list[str] = []
+    if mc_lib:
+        mc_library_dirs.extend(mc_lib.split(";"))
+    return [
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_mooncake",
+            sources=mooncake_sources,
+            include_dirs=mc_include_dirs,
+            library_dirs=mc_library_dirs,
+            libraries=["mooncake_store"],
+            runtime_library_dirs=mc_library_dirs,
+            extra_compile_args={
+                "cxx": extra_cxx_flags + ["-O3", "-std=c++20", "-DYLT_ENABLE_IBV"],
+            },
+        ),
+    ]
+
+
 def cuda_extension() -> tuple[list, dict]:
     # Third Party
     from torch.utils import cpp_extension  # Import here
@@ -74,12 +126,14 @@ def cuda_extension() -> tuple[list, dict]:
     cuda_sources = [
         "csrc/pybind.cpp",
         "csrc/mem_kernels.cu",
+        "csrc/mp_mem_kernels.cu",
         "csrc/cal_cdf.cu",
         "csrc/ac_enc.cu",
         "csrc/ac_dec.cu",
         "csrc/pos_kernels.cu",
         "csrc/mem_alloc.cpp",
         "csrc/utils.cpp",
+        "csrc/event_recorder.cpp",
     ]
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",
@@ -88,8 +142,16 @@ def cuda_extension() -> tuple[list, dict]:
         "csrc/storage_manager/utils.cpp",
     ]
     redis_sources = [
-        "csrc/redis/pybind.cpp",
-        "csrc/redis/resp.cpp",
+        "csrc/storage_backends/redis/pybind.cpp",
+        "csrc/storage_backends/redis/connector.cpp",
+    ]
+    fs_sources = [
+        "csrc/storage_backends/fs/pybind.cpp",
+        "csrc/storage_backends/fs/connector.cpp",
+    ]
+    mooncake_sources = [
+        "csrc/storage_backends/mooncake/pybind.cpp",
+        "csrc/storage_backends/mooncake/connector.cpp",
     ]
     ext_modules = [
         cpp_extension.CUDAExtension(
@@ -111,12 +173,24 @@ def cuda_extension() -> tuple[list, dict]:
         cpp_extension.CppExtension(
             "lmcache.lmcache_redis",
             sources=redis_sources,
-            include_dirs=["csrc/redis"],
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/redis"],
+            extra_compile_args={
+                "cxx": [flag_cxx_abi, "-O3", "-std=c++17"],
+            },
+        ),
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_fs",
+            sources=fs_sources,
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/fs"],
             extra_compile_args={
                 "cxx": [flag_cxx_abi, "-O3", "-std=c++17"],
             },
         ),
     ]
+    # Mooncake extension is optional.
+    ext_modules.extend(
+        _mooncake_extension(cpp_extension, mooncake_sources, [flag_cxx_abi])
+    )
     cmdclass = {"build_ext": cpp_extension.BuildExtension}
     return ext_modules, cmdclass
 
@@ -130,12 +204,14 @@ def rocm_extension() -> tuple[list, dict]:
     hip_sources = [
         "csrc/pybind_hip.cpp",  # Use the hipified pybind
         "csrc/mem_kernels.hip",
+        "csrc/mp_mem_kernels.hip",
         "csrc/cal_cdf.hip",
         "csrc/ac_enc.hip",
         "csrc/ac_dec.hip",
         "csrc/pos_kernels.hip",
         "csrc/mem_alloc_hip.cpp",
         "csrc/utils_hip.cpp",
+        "csrc/event_recorder.cpp",
     ]
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",
@@ -144,8 +220,16 @@ def rocm_extension() -> tuple[list, dict]:
         "csrc/storage_manager/utils.cpp",
     ]
     redis_sources = [
-        "csrc/redis/pybind.cpp",
-        "csrc/redis/resp.cpp",
+        "csrc/storage_backends/redis/pybind.cpp",
+        "csrc/storage_backends/redis/connector.cpp",
+    ]
+    fs_sources = [
+        "csrc/storage_backends/fs/pybind.cpp",
+        "csrc/storage_backends/fs/connector.cpp",
+    ]
+    mooncake_sources = [
+        "csrc/storage_backends/mooncake/pybind.cpp",
+        "csrc/storage_backends/mooncake/connector.cpp",
     ]
     # For HIP, we generally use CppExtension and let hipcc handle things.
     # Ensure CXX environment variable is set to hipcc when running this build.
@@ -189,12 +273,22 @@ def rocm_extension() -> tuple[list, dict]:
         cpp_extension.CppExtension(
             "lmcache.lmcache_redis",
             sources=redis_sources,
-            include_dirs=["csrc/redis"],
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/redis"],
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++17"],
+            },
+        ),
+        cpp_extension.CppExtension(
+            "lmcache.lmcache_fs",
+            sources=fs_sources,
+            include_dirs=["csrc/storage_backends", "csrc/storage_backends/fs"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
             },
         ),
     ]
+    # Mooncake extension is optional.
+    ext_modules.extend(_mooncake_extension(cpp_extension, mooncake_sources, []))
     cmdclass = {"build_ext": cpp_extension.BuildExtension}
     return ext_modules, cmdclass
 
@@ -214,6 +308,10 @@ if __name__ == "__main__":
 
     ext_modules, cmdclass = get_extension()
 
+    install_requires = _read_requirements(ROOT_DIR / "requirements" / "common.txt")
+    core_file = "rocm_core.txt" if BUILD_WITH_HIP else "cuda_core.txt"
+    install_requires += _read_requirements(ROOT_DIR / "requirements" / core_file)
+
     setup(
         packages=find_packages(
             exclude=("csrc",)
@@ -221,4 +319,5 @@ if __name__ == "__main__":
         ext_modules=ext_modules,
         cmdclass=cmdclass,
         include_package_data=True,
+        install_requires=install_requires,
     )

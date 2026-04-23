@@ -17,13 +17,11 @@ from lmcache.v1.distributed.config import (
     parse_args_to_config,
 )
 from lmcache.v1.mp_observability.config import (
-    PrometheusConfig,
-    add_prometheus_args,
-    parse_args_to_prometheus_config,
+    ObservabilityConfig,
+    add_observability_args,
+    parse_args_to_observability_config,
 )
-from lmcache.v1.mp_observability.prometheus_controller import (
-    get_prometheus_controller,
-)
+from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.multiprocess.config import (
     HTTPFrontendConfig,
     MPServerConfig,
@@ -32,7 +30,9 @@ from lmcache.v1.multiprocess.config import (
     parse_args_to_http_frontend_config,
     parse_args_to_mp_server_config,
 )
-from lmcache.v1.multiprocess.server import run_cache_server
+from lmcache.v1.multiprocess.mp_runtime_plugin_launcher import (
+    MPRuntimePluginLauncher,
+)
 
 logger = init_logger(__name__)
 
@@ -58,21 +58,54 @@ async def lifespan(app: FastAPI):
         "Starting LMCache HTTP server... (CUDA available: %s)",
         torch.cuda.is_available(),
     )
-    zmq_server, engine = run_cache_server(
-        mp_config=_configs["mp"],
+    mp_config = _configs["mp"]
+    if mp_config.engine_type == "blend":
+        # First Party
+        from lmcache.v1.multiprocess.blend_server_v2 import run_cache_server
+    else:
+        # First Party
+        from lmcache.v1.multiprocess.server import run_cache_server
+
+    result = run_cache_server(
+        mp_config=mp_config,
         storage_manager_config=_configs["storage_manager"],
-        prometheus_config=_configs["prometheus"],
+        obs_config=_configs["observability"],
         return_engine=True,
     )
+    assert result is not None, "run_cache_server returned None with return_engine=True"
+    zmq_server, engine = result
+
+    # Launch runtime plugins if configured. Plugins receive the full
+    # server config (including HTTP host/port) via the
+    # LMCACHE_RUNTIME_PLUGIN_CONFIG environment variable.
+    plugin_launcher = None
+    if mp_config.runtime_plugin_config.locations:
+        extra_kwargs = {}
+        http_config = _configs.get("http")
+        if http_config is not None:
+            extra_kwargs["http_config"] = http_config
+        plugin_launcher = MPRuntimePluginLauncher(
+            runtime_plugin_config=mp_config.runtime_plugin_config,
+            mp_config=mp_config,
+            storage_manager_config=_configs["storage_manager"],
+            obs_config=_configs["observability"],
+            **extra_kwargs,
+        )
+        plugin_launcher.launch_plugins()
+
     app.state.zmq_server = zmq_server
     app.state.engine = engine
+    app.state.plugin_launcher = plugin_launcher
     logger.info("LMCache HTTP server initialized")
 
     yield
 
     # Shutdown
     logger.info("Shutting down LMCache HTTP server...")
-    get_prometheus_controller().stop()
+    launcher = getattr(app.state, "plugin_launcher", None)
+    if launcher is not None:
+        launcher.stop_plugins()
+    get_event_bus().stop()
     if hasattr(app.state, "zmq_server") and app.state.zmq_server is not None:
         app.state.zmq_server.close()
     logger.info("LMCache HTTP server stopped")
@@ -102,20 +135,49 @@ async def healthcheck(request: Request):
             content={"status": "unhealthy", "reason": "engine not initialized"},
         )
 
-    if not engine.storage_manager.memcheck():
+    return {"status": "healthy"}
+
+
+@app.post("/api/clear-cache")
+async def clear_cache(request: Request):
+    """
+    Force-clear all KV cache data stored in L1 (CPU) memory.
+
+    This clears all objects including those with active read/write locks.
+    In-flight store or prefetch operations may be corrupted.
+    """
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "reason": "memory check failed"},
+            content={"status": "error", "reason": "engine not initialized"},
         )
 
-    return {"status": "healthy"}
+    engine.clear()
+    logger.info("Cache cleared via HTTP API")
+    return {"status": "ok"}
+
+
+@app.get("/api/status")
+async def status(request: Request):
+    """
+    Detailed status endpoint for inspecting internal state of all
+    MP components (L1 cache, L2 adapters, controllers, sessions).
+    """
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "engine not initialized"},
+        )
+    return engine.report_status()
 
 
 def run_http_server(
     http_config: HTTPFrontendConfig,
     mp_config: MPServerConfig,
     storage_manager_config: StorageManagerConfig,
-    prometheus_config: PrometheusConfig,
+    obs_config: ObservabilityConfig,
 ) -> None:
     """
     Run the LMCache HTTP server with integrated MP (ZMQ) server.
@@ -124,11 +186,12 @@ def run_http_server(
         http_config: Configuration for the HTTP frontend
         mp_config: Configuration for the ZMQ multiprocess server
         storage_manager_config: Configuration for the storage manager
-        prometheus_config: Configuration for the Prometheus observability stack
+        obs_config: Configuration for the observability stack
     """
     _configs["mp"] = mp_config
     _configs["storage_manager"] = storage_manager_config
-    _configs["prometheus"] = prometheus_config
+    _configs["observability"] = obs_config
+    _configs["http"] = http_config
 
     config = uvicorn.Config(
         app=app,
@@ -154,7 +217,7 @@ def parse_args():
     add_http_frontend_args(parser)
     add_mp_server_args(parser)
     add_storage_manager_args(parser)
-    add_prometheus_args(parser)
+    add_observability_args(parser)
     return parser.parse_args()
 
 
@@ -163,10 +226,10 @@ if __name__ == "__main__":
     http_config = parse_args_to_http_frontend_config(args)
     mp_config = parse_args_to_mp_server_config(args)
     storage_manager_config = parse_args_to_config(args)
-    prometheus_config = parse_args_to_prometheus_config(args)
+    obs_config = parse_args_to_observability_config(args)
     run_http_server(
         http_config=http_config,
         mp_config=mp_config,
         storage_manager_config=storage_manager_config,
-        prometheus_config=prometheus_config,
+        obs_config=obs_config,
     )
